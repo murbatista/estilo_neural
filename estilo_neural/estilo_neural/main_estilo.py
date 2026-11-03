@@ -1,191 +1,362 @@
+
 import os
 import glob
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from PIL import Image
-import torchvision.transforms as transforms
-import torchvision.models as models
+from torchvision import transforms, models
 
-# 1. Configuração de Hardware
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Executando no dispositivo: {device}")
 
-# 2. Pré-processamento e Carregamento
-imsize = 512 if torch.cuda.is_available() else 256
+# -------------------------------------------------------------
+# 1. CONFIGURAÇÃO DO DISPOSITIVO
+# -------------------------------------------------------------
 
-loader = transforms.Compose([
-    transforms.Resize((imsize, imsize)),
+dispositivo = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+print(f"Dispositivo utilizado: {dispositivo}")
+
+tamanho_imagem = 512 if torch.cuda.is_available() else 256
+
+
+# -------------------------------------------------------------
+# 2. PREPARAÇÃO DAS IMAGENS
+# -------------------------------------------------------------
+
+transformacao = transforms.Compose([
+    transforms.Resize((tamanho_imagem, tamanho_imagem)),
     transforms.ToTensor()
 ])
 
-def image_loader(image_path):
-    image = Image.open(image_path).convert('RGB')
-    image = loader(image).unsqueeze(0)
-    return image.to(device, torch.float)
 
-# 3. Funções de Perda (Loss Functions)
-class ContentLoss(nn.Module):
-    def __init__(self, target):
-        super(ContentLoss, self).__init__()
-        self.target = target.detach()
+def carregar_imagem(caminho):
 
-    def forward(self, input):
-        self.loss = nn.functional.mse_loss(input, self.target)
-        return input
+    with Image.open(caminho) as imagem:
+        imagem = imagem.convert("RGB")
+        imagem = transformacao(imagem).unsqueeze(0)
 
-def gram_matrix(input):
-    a, b, c, d = input.size()
-    features = input.view(a * b, c * d)
-    G = torch.mm(features, features.t())
-    return G.div(a * b * c * d)
+    return imagem.to(dispositivo, torch.float)
 
-class MultiStyleLoss(nn.Module):
-    def __init__(self, target_features_list):
-        super(MultiStyleLoss, self).__init__()
-        # Calcula a média das Matrizes de Gram de TODAS as fotos da pasta
-        gram_list = [gram_matrix(feat).detach() for feat in target_features_list]
-        self.target = torch.stack(gram_list).mean(dim=0)
 
-    def forward(self, input):
-        G = gram_matrix(input)
-        self.loss = nn.functional.mse_loss(G, self.target)
-        return input
+# -------------------------------------------------------------
+# 3. CÁLCULO DAS PERDAS DE CONTEÚDO E ESTILO
+# -------------------------------------------------------------
 
-# 4. Carregamento da VGG19
-cnn = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features.to(device).eval()
+class PerdaConteudo(nn.Module):
 
-cnn_normalization_mean = torch.tensor([0.485, 0.456, 0.406]).to(device)
-cnn_normalization_std = torch.tensor([0.229, 0.224, 0.225]).to(device)
+    def __init__(self, imagem_referencia):
+        super().__init__()
 
-class Normalization(nn.Module):
-    def __init__(self, mean, std):
-        super(Normalization, self).__init__()
-        self.mean = self.mean = mean.view(-1, 1, 1)
-        self.std = std.view(-1, 1, 1)
+        self.referencia = imagem_referencia.detach()
 
-    def forward(self, img):
-        return (img - self.mean) / self.std
+    def forward(self, entrada):
 
-content_layers_default = ['conv_4']
-style_layers_default = ['conv_1', 'conv_2', 'conv_3', 'conv_4', 'conv_5']
+        self.loss = nn.functional.mse_loss(
+            entrada, self.referencia
+        )
 
-# 5. Carregar Todas as Imagens da Pasta de Estilo
-PASTA_ESTILOS = "minha_base_estilos"
-extensoes = ("*.jpg", "*.jpeg", "*.png")
-caminhos_estilos = []
+        return entrada
 
-for ext in extensoes:
-    caminhos_estilos.extend(glob.glob(os.path.join(PASTA_ESTILOS, ext)))
 
-if not caminhos_estilos:
-    print(f"⚠️ Nenhuma imagem encontrada na pasta '{PASTA_ESTILOS}'!")
+def calcular_gram(matriz):
+
+    lote, canais, altura, largura = matriz.size()
+
+    caracteristicas = matriz.view(
+        lote * canais,
+        altura * largura
+    )
+
+    gram = torch.mm(
+        caracteristicas,
+        caracteristicas.t()
+    )
+
+    return gram / (lote * canais * altura * largura)
+
+
+class PerdaMultiplosEstilos(nn.Module):
+
+    def __init__(self, caracteristicas_estilo):
+        super().__init__()
+
+        matrizes = [
+            calcular_gram(caracteristica).detach()
+            for caracteristica in caracteristicas_estilo
+        ]
+
+        self.referencia = torch.stack(matrizes).mean(dim=0)
+
+    def forward(self, entrada):
+
+        matriz_atual = calcular_gram(entrada)
+
+        self.loss = nn.functional.mse_loss(
+            matriz_atual, self.referencia
+        )
+
+        return entrada
+
+
+# -------------------------------------------------------------
+# 4. CARREGAMENTO DA REDE NEURAL VGG19
+# -------------------------------------------------------------
+
+rede_vgg = models.vgg19(
+    weights=models.VGG19_Weights.DEFAULT
+).features.to(dispositivo).eval()
+
+
+media = torch.tensor(
+    [0.485, 0.456, 0.406]
+).to(dispositivo)
+
+desvio = torch.tensor(
+    [0.229, 0.224, 0.225]
+).to(dispositivo)
+
+
+class NormalizarImagem(nn.Module):
+
+    def __init__(self, media, desvio):
+        super().__init__()
+
+        self.media = media.view(-1, 1, 1)
+        self.desvio = desvio.view(-1, 1, 1)
+
+    def forward(self, imagem):
+
+        return (imagem - self.media) / self.desvio
+
+
+camadas_conteudo = ["conv_4"]
+
+camadas_estilo = [
+    "conv_1",
+    "conv_2",
+    "conv_3",
+    "conv_4",
+    "conv_5"
+]
+
+
+# -------------------------------------------------------------
+# 5. LOCALIZAÇÃO DAS IMAGENS DE REFERÊNCIA
+# -------------------------------------------------------------
+
+diretorio_estilos = "minha_base_estilos"
+
+formatos_imagem = ("*.jpg", "*.jpeg", "*.png")
+
+imagens_encontradas = []
+
+for formato in formatos_imagem:
+
+    imagens_encontradas.extend(
+        glob.glob(os.path.join(diretorio_estilos, formato))
+    )
+
+
+if not imagens_encontradas:
+
+    print(
+        f"Nenhuma imagem encontrada em '{diretorio_estilos}'!"
+    )
+
     exit()
 
-print(f"✓ Carregando {len(caminhos_estilos)} fotos de estilo da pasta...")
-style_imgs = [image_loader(p) for p in caminhos_estilos]
-content_img = image_loader("emkanicepic-borgward-6621359.jpg")
 
-# 6. Montagem do Modelo com Múltiplos Estilos
-def get_style_model_and_losses(cnn, normalization_mean, normalization_std,
-                               style_imgs, content_img,
-                               content_layers=content_layers_default,
-                               style_layers=style_layers_default):
-    
-    normalization = Normalization(normalization_mean, normalization_std).to(device)
-    content_losses = []
-    style_losses = []
-
-    model = nn.Sequential(normalization)
-
-    i = 0
-    for layer in cnn.children():
-        if isinstance(layer, nn.Conv2d):
-            i += 1
-            name = f'conv_{i}'
-        elif isinstance(layer, nn.ReLU):
-            name = f'relu_{i}'
-            layer = nn.ReLU(inplace=False)
-        elif isinstance(layer, nn.MaxPool2d):
-            name = f'pool_{i}'
-        elif isinstance(layer, nn.BatchNorm2d):
-            name = f'bn_{i}'
-
-        model.add_module(name, layer)
-
-        if name in content_layers:
-            target = model(content_img).detach()
-            content_loss = ContentLoss(target)
-            model.add_module(f"content_loss_{i}", content_loss)
-            content_losses.append(content_loss)
-
-        if name in style_layers:
-            # Extrai as características de TODAS as imagens da pasta para essa camada
-            target_features = [model(s_img).detach() for s_img in style_imgs]
-            style_loss = MultiStyleLoss(target_features)
-            model.add_module(f"style_loss_{i}", style_loss)
-            style_losses.append(style_loss)
-
-    for i in range(len(model) - 1, -1, -1):
-        if isinstance(model[i], ContentLoss) or isinstance(model[i], MultiStyleLoss):
-            break
-
-    model = model[:i+1]
-    return model, style_losses, content_losses
-
-# 7. Processo de Otimização
-input_img = content_img.clone()
-
-print("Construindo o modelo de transferência multi-estilo...")
-model, style_losses, content_losses = get_style_model_and_losses(
-    cnn, cnn_normalization_mean, cnn_normalization_std, style_imgs, content_img
+print(
+    f"\nForam encontradas {len(imagens_encontradas)} imagens de estilo."
 )
 
-optimizer = optim.LBFGS([input_img.requires_grad_()])
+imagens_estilo = [
+    carregar_imagem(caminho)
+    for caminho in imagens_encontradas
+]
 
-num_steps = 300
-style_weight = 1000000
-content_weight = 1
+imagem_original = carregar_imagem(
+    "emkanicepic-borgward-6621359.jpg"
+)
 
-run = [0]
-print("Iniciando a otimização com a base de fotos...")
 
-while run[0] <= num_steps:
-    def closure():
+# -------------------------------------------------------------
+# 6. CONSTRUÇÃO DO MODELO DE TRANSFERÊNCIA DE ESTILO
+# -------------------------------------------------------------
+
+def construir_modelo(rede, media, desvio,
+                     estilos, conteudo):
+
+    normalizacao = NormalizarImagem(
+        media, desvio
+    ).to(dispositivo)
+
+    modelo = nn.Sequential(normalizacao)
+
+    perdas_estilo = []
+    perdas_conteudo = []
+
+    contador = 0
+
+    for camada in rede.children():
+
+        if isinstance(camada, nn.Conv2d):
+
+            contador += 1
+            nome = f"conv_{contador}"
+
+        elif isinstance(camada, nn.ReLU):
+
+            nome = f"relu_{contador}"
+            camada = nn.ReLU(inplace=False)
+
+        elif isinstance(camada, nn.MaxPool2d):
+
+            nome = f"pool_{contador}"
+
+        elif isinstance(camada, nn.BatchNorm2d):
+
+            nome = f"bn_{contador}"
+
+        else:
+            continue
+
+        modelo.add_module(nome, camada)
+
+        # Extração das características de conteúdo
+        if nome in camadas_conteudo:
+
+            referencia = modelo(conteudo).detach()
+
+            perda = PerdaConteudo(referencia)
+
+            modelo.add_module(
+                f"perda_conteudo_{contador}", perda
+            )
+
+            perdas_conteudo.append(perda)
+
+        # Extração das características de todas as imagens de estilo
+        if nome in camadas_estilo:
+
+            caracteristicas = [
+                modelo(estilo).detach()
+                for estilo in estilos
+            ]
+
+            perda = PerdaMultiplosEstilos(caracteristicas)
+
+            modelo.add_module(
+                f"perda_estilo_{contador}", perda
+            )
+
+            perdas_estilo.append(perda)
+
+    # Remove as camadas posteriores às últimas perdas
+    for indice in range(len(modelo) - 1, -1, -1):
+
+        if isinstance(
+            modelo[indice],
+            (PerdaConteudo, PerdaMultiplosEstilos)
+        ):
+            break
+
+    modelo = modelo[:indice + 1]
+
+    return modelo, perdas_estilo, perdas_conteudo
+
+
+# -------------------------------------------------------------
+# 7. OTIMIZAÇÃO DA IMAGEM
+# -------------------------------------------------------------
+
+imagem_gerada = imagem_original.clone()
+
+print("\nMontando o modelo de transferência de estilo...")
+
+modelo, perdas_estilo, perdas_conteudo = construir_modelo(
+    rede_vgg,
+    media,
+    desvio,
+    imagens_estilo,
+    imagem_original
+)
+
+otimizador = optim.LBFGS([
+    imagem_gerada.requires_grad_()
+])
+
+total_etapas = 300
+
+peso_estilo = 1000000
+peso_conteudo = 1
+
+etapa_atual = [0]
+
+print("\nIniciando o processo de combinação das imagens...")
+
+
+while etapa_atual[0] <= total_etapas:
+
+    def calcular_perda():
+
         with torch.no_grad():
-            input_img.clamp_(0, 1)
+            imagem_gerada.clamp_(0, 1)
 
-        optimizer.zero_grad()
-        model(input_img)
-        style_score = 0
-        content_score = 0
+        otimizador.zero_grad()
 
-        for sl in style_losses:
-            style_score += sl.loss
-        for cl in content_losses:
-            content_score += cl.loss
+        modelo(imagem_gerada)
 
-        style_score *= style_weight
-        content_score *= content_weight
+        valor_estilo = 0
+        valor_conteudo = 0
 
-        loss = style_score + content_score
-        loss.backward()
+        for perda in perdas_estilo:
+            valor_estilo += perda.loss
 
-        run[0] += 1
-        if run[0] % 50 == 0:
-            print(f"Passo {run[0]}/{num_steps} | Perda Estilo: {style_score.item():.4f} | Perda Conteúdo: {content_score.item():.4f}")
+        for perda in perdas_conteudo:
+            valor_conteudo += perda.loss
 
-        return style_score + content_score
+        valor_estilo *= peso_estilo
+        valor_conteudo *= peso_conteudo
 
-    optimizer.step(closure)
+        perda_total = valor_estilo + valor_conteudo
+
+        perda_total.backward()
+
+        etapa_atual[0] += 1
+
+        if etapa_atual[0] % 50 == 0:
+
+            print(
+                f"Etapa {etapa_atual[0]}/{total_etapas} | "
+                f"Estilo: {valor_estilo.item():.4f} | "
+                f"Conteúdo: {valor_conteudo.item():.4f}"
+            )
+
+        return perda_total
+
+    otimizador.step(calcular_perda)
+
+
+# -------------------------------------------------------------
+# 8. EXPORTAÇÃO DA IMAGEM RESULTANTE
+# -------------------------------------------------------------
 
 with torch.no_grad():
-    input_img.clamp_(0, 1)
+    imagem_gerada.clamp_(0, 1)
 
-# 8. Salvando a Imagem Final
-unloader = transforms.ToPILImage()
-image = input_img.cpu().clone().squeeze(0)
-image = unloader(image)
-image.save("resultado_combina_pasta.jpg")
+converter_imagem = transforms.ToPILImage()
 
-print("\n🎉 Imagem final gerada com sucesso e salva como 'resultado_combina_pasta.jpg'!")
+resultado = imagem_gerada.cpu().clone().squeeze(0)
+
+resultado = converter_imagem(resultado)
+
+nome_resultado = "resultado_combina_pasta.jpg"
+
+resultado.save(nome_resultado)
+
+print("\nProcesso concluído com sucesso!")
+print(f"Imagem salva como: {os.path.abspath(nome_resultado)}")
